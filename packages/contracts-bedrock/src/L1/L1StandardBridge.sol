@@ -328,8 +328,8 @@ contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, Reinitializabl
         if (kind == BridgeHookTypes.TokenKind.Mintable) return;
 
         // The hook must approve this bridge for the amount before it calls the Portal to complete the item.
-        IERC20(l1Token).safeTransferFrom(hook, address(this), amount);
         deposits[l1Token][l2Token] += amount;
+        IERC20(l1Token).safeTransferFrom(hook, address(this), amount);
         emit ERC20Restored(_id, l1Token, l2Token, amount);
     }
 
