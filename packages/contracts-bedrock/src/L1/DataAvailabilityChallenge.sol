@@ -415,10 +415,10 @@ contract DataAvailabilityChallenge is OwnableUpgradeable, ISemver {
         }
 
         // burn the remaining bond
+        _resolvedChallenge.lockedBond = 0;
         if (lockedBond > 0) {
             payable(address(0)).transfer(lockedBond);
         }
-        _resolvedChallenge.lockedBond = 0;
     }
 
     /// @notice Unlock the bond associated with an expired challenge.
