@@ -1,0 +1,460 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.15;
+
+// Contracts
+import { ProxyAdminOwnedBase } from "src/universal/ProxyAdminOwnedBase.sol";
+import { ReinitializableBase } from "src/universal/ReinitializableBase.sol";
+import { StandardBridge } from "src/universal/StandardBridge.sol";
+
+// Libraries
+import { Predeploys } from "src/libraries/Predeploys.sol";
+import { BridgeHookTypes } from "src/libraries/BridgeHookTypes.sol";
+import { BridgeHookDecoder } from "src/libraries/BridgeHookDecoder.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+// Interfaces
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { ISemver } from "interfaces/universal/ISemver.sol";
+import { ICrossDomainMessenger } from "interfaces/universal/ICrossDomainMessenger.sol";
+import { ISystemConfig } from "interfaces/L1/ISystemConfig.sol";
+import { ISuperchainConfig } from "interfaces/L1/ISuperchainConfig.sol";
+import { IOptimismPortal2 } from "interfaces/L1/IOptimismPortal2.sol";
+
+/// @custom:proxied true
+/// @title L1StandardBridge
+/// @notice The L1StandardBridge is responsible for transferring ETH and ERC20 tokens between L1 and
+///         L2. In the case that an ERC20 token is native to L1, it will be escrowed within this
+///         contract. If the ERC20 token is native to L2, it will be burnt. Before Bedrock, ETH was
+///         stored within this contract. After Bedrock, ETH is instead stored inside the
+///         OptimismPortal contract.
+///         NOTE: this contract is not intended to support all variations of ERC20 tokens. Examples
+///         of some token types that may not be properly supported by this contract include, but are
+///         not limited to: tokens with transfer fees, rebasing tokens, and tokens with blocklists.
+contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, ReinitializableBase, ISemver {
+    using SafeERC20 for IERC20;
+
+    /// @notice Thrown when the caller is not the OptimismPortal.
+    error L1StandardBridge_NotPortal();
+
+    /// @notice Thrown when the OptimismPortal has no bridge hook.
+    error L1StandardBridge_NoBridgeHook();
+
+    /// @notice Thrown when the message is not a finalizeBridgeERC20 call.
+    error L1StandardBridge_InvalidTokenTransfer();
+
+    /// @notice Thrown when the escrow of the token pair is below the amount to hold.
+    error L1StandardBridge_InsufficientDeposits();
+
+    /// @notice Thrown when no hold is recorded for the item.
+    error L1StandardBridge_TransferNotHeld();
+
+    /// @custom:legacy
+    /// @notice Emitted whenever a deposit of ETH from L1 into L2 is initiated.
+    /// @param from      Address of the depositor.
+    /// @param to        Address of the recipient on L2.
+    /// @param amount    Amount of ETH deposited.
+    /// @param extraData Extra data attached to the deposit.
+    event ETHDepositInitiated(address indexed from, address indexed to, uint256 amount, bytes extraData);
+
+    /// @custom:legacy
+    /// @notice Emitted whenever a withdrawal of ETH from L2 to L1 is finalized.
+    /// @param from      Address of the withdrawer.
+    /// @param to        Address of the recipient on L1.
+    /// @param amount    Amount of ETH withdrawn.
+    /// @param extraData Extra data attached to the withdrawal.
+    event ETHWithdrawalFinalized(address indexed from, address indexed to, uint256 amount, bytes extraData);
+
+    /// @custom:legacy
+    /// @notice Emitted whenever an ERC20 deposit is initiated.
+    /// @param l1Token   Address of the token on L1.
+    /// @param l2Token   Address of the corresponding token on L2.
+    /// @param from      Address of the depositor.
+    /// @param to        Address of the recipient on L2.
+    /// @param amount    Amount of the ERC20 deposited.
+    /// @param extraData Extra data attached to the deposit.
+    event ERC20DepositInitiated(
+        address indexed l1Token,
+        address indexed l2Token,
+        address indexed from,
+        address to,
+        uint256 amount,
+        bytes extraData
+    );
+
+    /// @custom:legacy
+    /// @notice Emitted whenever an ERC20 withdrawal is finalized.
+    /// @param l1Token   Address of the token on L1.
+    /// @param l2Token   Address of the corresponding token on L2.
+    /// @param from      Address of the withdrawer.
+    /// @param to        Address of the recipient on L1.
+    /// @param amount    Amount of the ERC20 withdrawn.
+    /// @param extraData Extra data attached to the withdrawal.
+    event ERC20WithdrawalFinalized(
+        address indexed l1Token,
+        address indexed l2Token,
+        address indexed from,
+        address to,
+        uint256 amount,
+        bytes extraData
+    );
+
+    /// @notice Emitted when escrowed tokens move to the OptimismPortal's bridge hook.
+    /// @param id      Identifier of the held item.
+    /// @param l1Token Address of the token on L1.
+    /// @param l2Token Address of the corresponding token on L2.
+    /// @param amount  Amount of the token moved.
+    event ERC20Held(bytes32 indexed id, address indexed l1Token, address indexed l2Token, uint256 amount);
+
+    /// @notice Emitted when tokens move from the OptimismPortal's bridge hook back into escrow.
+    /// @param id      Identifier of the held item.
+    /// @param l1Token Address of the token on L1.
+    /// @param l2Token Address of the corresponding token on L2.
+    /// @param amount  Amount of the token moved.
+    event ERC20Restored(bytes32 indexed id, address indexed l1Token, address indexed l2Token, uint256 amount);
+
+    /// @notice Semantic version.
+    /// @custom:semver 3.0.0
+    string public constant version = "3.0.0";
+
+    /// @custom:legacy
+    /// @custom:spacer superchainConfig
+    /// @notice Spacer taking up the legacy `superchainConfig` slot.
+    address private spacer_50_0_20;
+
+    /// @custom:legacy
+    /// @custom:spacer systemConfig
+    /// @notice Spacer taking up the legacy `systemConfig` slot.
+    address private spacer_51_0_20;
+
+    /// @notice Address of the SystemConfig contract.
+    ISystemConfig public systemConfig;
+
+    /// @notice Token kinds of held token transfers, keyed by item ID.
+    mapping(bytes32 => BridgeHookTypes.TokenKind) public heldTokenKinds;
+
+    /// @notice Constructs the L1StandardBridge contract.
+    constructor() StandardBridge() ReinitializableBase(3) {
+        _disableInitializers();
+    }
+
+    /// @notice Initializer.
+    /// @param _messenger        Contract for the CrossDomainMessenger on this network.
+    /// @param _systemConfig Contract for the SystemConfig on this network.
+    function initialize(
+        ICrossDomainMessenger _messenger,
+        ISystemConfig _systemConfig
+    )
+        external
+        reinitializer(initVersion())
+    {
+        // Initialization transactions must come from the ProxyAdmin or its owner.
+        _assertOnlyProxyAdminOrProxyAdminOwner();
+
+        // Now perform initialization logic.
+        systemConfig = _systemConfig;
+        __StandardBridge_init({
+            _messenger: _messenger, _otherBridge: StandardBridge(payable(Predeploys.L2_STANDARD_BRIDGE))
+        });
+    }
+
+    /// @inheritdoc StandardBridge
+    function paused() public view override returns (bool) {
+        return systemConfig.paused();
+    }
+
+    /// @notice Returns the SuperchainConfig contract.
+    /// @return ISuperchainConfig The SuperchainConfig contract.
+    function superchainConfig() public view returns (ISuperchainConfig) {
+        return systemConfig.superchainConfig();
+    }
+
+    /// @notice Allows EOAs to bridge ETH by sending directly to the bridge.
+    receive() external payable override onlyEOA {
+        _initiateETHDeposit(msg.sender, msg.sender, RECEIVE_DEFAULT_GAS_LIMIT, bytes(""));
+    }
+
+    /// @custom:legacy
+    /// @notice Deposits some amount of ETH into the sender's account on L2.
+    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
+    /// @param _extraData   Optional data to forward to L2.
+    ///                     Data supplied here will not be used to execute any code on L2 and is
+    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    function depositETH(uint32 _minGasLimit, bytes calldata _extraData) external payable onlyEOA {
+        _initiateETHDeposit(msg.sender, msg.sender, _minGasLimit, _extraData);
+    }
+
+    /// @custom:legacy
+    /// @notice Deposits some amount of ETH into a target account on L2.
+    ///         Note that if ETH is sent to a contract on L2 and the call fails, then that ETH will
+    ///         be locked in the L2StandardBridge. ETH may be recoverable if the call can be
+    ///         successfully replayed by increasing the amount of gas supplied to the call. If the
+    ///         call will fail for any amount of gas, then the ETH will be locked permanently.
+    /// @param _to          Address of the recipient on L2.
+    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
+    /// @param _extraData   Optional data to forward to L2.
+    ///                     Data supplied here will not be used to execute any code on L2 and is
+    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    function depositETHTo(address _to, uint32 _minGasLimit, bytes calldata _extraData) external payable {
+        _initiateETHDeposit(msg.sender, _to, _minGasLimit, _extraData);
+    }
+
+    /// @custom:legacy
+    /// @notice Deposits some amount of ERC20 tokens into the sender's account on L2.
+    /// @param _l1Token     Address of the L1 token being deposited.
+    /// @param _l2Token     Address of the corresponding token on L2.
+    /// @param _amount      Amount of the ERC20 to deposit.
+    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
+    /// @param _extraData   Optional data to forward to L2.
+    ///                     Data supplied here will not be used to execute any code on L2 and is
+    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    function depositERC20(
+        address _l1Token,
+        address _l2Token,
+        uint256 _amount,
+        uint32 _minGasLimit,
+        bytes calldata _extraData
+    )
+        external
+        virtual
+        onlyEOA
+    {
+        _initiateERC20Deposit(_l1Token, _l2Token, msg.sender, msg.sender, _amount, _minGasLimit, _extraData);
+    }
+
+    /// @custom:legacy
+    /// @notice Deposits some amount of ERC20 tokens into a target account on L2.
+    /// @param _l1Token     Address of the L1 token being deposited.
+    /// @param _l2Token     Address of the corresponding token on L2.
+    /// @param _to          Address of the recipient on L2.
+    /// @param _amount      Amount of the ERC20 to deposit.
+    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
+    /// @param _extraData   Optional data to forward to L2.
+    ///                     Data supplied here will not be used to execute any code on L2 and is
+    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    function depositERC20To(
+        address _l1Token,
+        address _l2Token,
+        address _to,
+        uint256 _amount,
+        uint32 _minGasLimit,
+        bytes calldata _extraData
+    )
+        external
+        virtual
+    {
+        _initiateERC20Deposit(_l1Token, _l2Token, msg.sender, _to, _amount, _minGasLimit, _extraData);
+    }
+
+    /// @custom:legacy
+    /// @notice Finalizes a withdrawal of ETH from L2.
+    /// @param _from      Address of the withdrawer on L2.
+    /// @param _to        Address of the recipient on L1.
+    /// @param _amount    Amount of ETH to withdraw.
+    /// @param _extraData Optional data forwarded from L2.
+    function finalizeETHWithdrawal(
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes calldata _extraData
+    )
+        external
+        payable
+    {
+        finalizeBridgeETH(_from, _to, _amount, _extraData);
+    }
+
+    /// @custom:legacy
+    /// @notice Finalizes a withdrawal of ERC20 tokens from L2.
+    /// @param _l1Token   Address of the token on L1.
+    /// @param _l2Token   Address of the corresponding token on L2.
+    /// @param _from      Address of the withdrawer on L2.
+    /// @param _to        Address of the recipient on L1.
+    /// @param _amount    Amount of the ERC20 to withdraw.
+    /// @param _extraData Optional data forwarded from L2.
+    function finalizeERC20Withdrawal(
+        address _l1Token,
+        address _l2Token,
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes calldata _extraData
+    )
+        external
+    {
+        finalizeBridgeERC20(_l1Token, _l2Token, _from, _to, _amount, _extraData);
+    }
+
+    /// @custom:legacy
+    /// @notice Retrieves the access of the corresponding L2 bridge contract.
+    /// @return Address of the corresponding L2 bridge contract.
+    function l2TokenBridge() external view returns (address) {
+        return address(otherBridge);
+    }
+
+    /// @notice Moves escrowed tokens to the Portal's bridge hook. Only callable by the Portal.
+    /// @param _id Identifier of the held item.
+    /// @param _direction Transfer direction, which identifies the L1 and L2 tokens in the message.
+    /// @param _message Encoded finalizeBridgeERC20 call.
+    function holdERC20(bytes32 _id, BridgeHookTypes.Direction _direction, bytes calldata _message) external {
+        (address hook, address l1Token, address l2Token, uint256 amount) = _checkPortalAndDecode(_direction, _message);
+
+        // The Portal gives each item a unique ID and prevents the same item from being held twice.
+        //
+        // OptimismMintableERC20 tokens have no escrow on L1. The bridge burns them on deposit
+        // and mints them on withdrawal, so only their message is held.
+        if (_isOptimismMintableERC20(l1Token)) {
+            heldTokenKinds[_id] = BridgeHookTypes.TokenKind.Mintable;
+            return;
+        }
+        heldTokenKinds[_id] = BridgeHookTypes.TokenKind.Escrowed;
+
+        if (deposits[l1Token][l2Token] < amount) revert L1StandardBridge_InsufficientDeposits();
+        deposits[l1Token][l2Token] -= amount;
+        IERC20(l1Token).safeTransfer(hook, amount);
+        emit ERC20Held(_id, l1Token, l2Token, amount);
+    }
+
+    /// @notice Pulls tokens from the Portal's bridge hook back into escrow. Only callable by the Portal.
+    /// @param _id Identifier of the held item.
+    /// @param _direction Transfer direction, which identifies the L1 and L2 tokens in the message.
+    /// @param _message Encoded finalizeBridgeERC20 call.
+    function restoreERC20(bytes32 _id, BridgeHookTypes.Direction _direction, bytes calldata _message) external {
+        (address hook, address l1Token, address l2Token, uint256 amount) = _checkPortalAndDecode(_direction, _message);
+
+        // Use the kind recorded by `holdERC20` because the token can change its `supportsInterface` result.
+        BridgeHookTypes.TokenKind kind = heldTokenKinds[_id];
+        if (kind == BridgeHookTypes.TokenKind.None) revert L1StandardBridge_TransferNotHeld();
+        delete heldTokenKinds[_id];
+        if (kind == BridgeHookTypes.TokenKind.Mintable) return;
+
+        // The hook must approve this bridge for the amount before it calls the Portal to complete the item.
+        IERC20(l1Token).safeTransferFrom(hook, address(this), amount);
+        deposits[l1Token][l2Token] += amount;
+        emit ERC20Restored(_id, l1Token, l2Token, amount);
+    }
+
+    /// @notice Decodes an ERC20 transfer. Requires the Portal as caller and a configured bridge hook.
+    /// @param _direction Transfer direction used to identify the L1 and L2 tokens.
+    /// @param _message Encoded finalizeBridgeERC20 call.
+    /// @return hook_ Portal's bridge hook address.
+    /// @return l1Token_ L1 token address.
+    /// @return l2Token_ L2 token address.
+    /// @return amount_ Transfer amount.
+    function _checkPortalAndDecode(
+        BridgeHookTypes.Direction _direction,
+        bytes calldata _message
+    )
+        internal
+        view
+        returns (address hook_, address l1Token_, address l2Token_, uint256 amount_)
+    {
+        IOptimismPortal2 portal = IOptimismPortal2(payable(systemConfig.optimismPortal()));
+        if (msg.sender != address(portal)) revert L1StandardBridge_NotPortal();
+
+        hook_ = address(portal.bridgeHook());
+        if (hook_ == address(0)) revert L1StandardBridge_NoBridgeHook();
+
+        bool valid;
+        (valid, l1Token_, l2Token_, amount_) = BridgeHookDecoder.decodeTokenTransfer(_direction, _message);
+        if (!valid) revert L1StandardBridge_InvalidTokenTransfer();
+    }
+
+    /// @notice Internal function for initiating an ETH deposit.
+    /// @param _from        Address of the sender on L1.
+    /// @param _to          Address of the recipient on L2.
+    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
+    /// @param _extraData   Optional data to forward to L2.
+    function _initiateETHDeposit(address _from, address _to, uint32 _minGasLimit, bytes memory _extraData) internal {
+        _initiateBridgeETH(_from, _to, msg.value, _minGasLimit, _extraData);
+    }
+
+    /// @notice Internal function for initiating an ERC20 deposit.
+    /// @param _l1Token     Address of the L1 token being deposited.
+    /// @param _l2Token     Address of the corresponding token on L2.
+    /// @param _from        Address of the sender on L1.
+    /// @param _to          Address of the recipient on L2.
+    /// @param _amount      Amount of the ERC20 to deposit.
+    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
+    /// @param _extraData   Optional data to forward to L2.
+    function _initiateERC20Deposit(
+        address _l1Token,
+        address _l2Token,
+        address _from,
+        address _to,
+        uint256 _amount,
+        uint32 _minGasLimit,
+        bytes memory _extraData
+    )
+        internal
+    {
+        _initiateBridgeERC20(_l1Token, _l2Token, _from, _to, _amount, _minGasLimit, _extraData);
+    }
+
+    /// @inheritdoc StandardBridge
+    /// @notice Emits the legacy ETHDepositInitiated event followed by the ETHBridgeInitiated event.
+    ///         This is necessary for backwards compatibility with the legacy bridge.
+    function _emitETHBridgeInitiated(
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes memory _extraData
+    )
+        internal
+        override
+    {
+        emit ETHDepositInitiated(_from, _to, _amount, _extraData);
+        super._emitETHBridgeInitiated(_from, _to, _amount, _extraData);
+    }
+
+    /// @inheritdoc StandardBridge
+    /// @notice Emits the legacy ERC20DepositInitiated event followed by the ERC20BridgeInitiated
+    ///         event. This is necessary for backwards compatibility with the legacy bridge.
+    function _emitETHBridgeFinalized(
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes memory _extraData
+    )
+        internal
+        override
+    {
+        emit ETHWithdrawalFinalized(_from, _to, _amount, _extraData);
+        super._emitETHBridgeFinalized(_from, _to, _amount, _extraData);
+    }
+
+    /// @inheritdoc StandardBridge
+    /// @notice Emits the legacy ERC20WithdrawalFinalized event followed by the ERC20BridgeFinalized
+    ///         event. This is necessary for backwards compatibility with the legacy bridge.
+    function _emitERC20BridgeInitiated(
+        address _localToken,
+        address _remoteToken,
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes memory _extraData
+    )
+        internal
+        override
+    {
+        emit ERC20DepositInitiated(_localToken, _remoteToken, _from, _to, _amount, _extraData);
+        super._emitERC20BridgeInitiated(_localToken, _remoteToken, _from, _to, _amount, _extraData);
+    }
+
+    /// @inheritdoc StandardBridge
+    /// @notice Emits the legacy ERC20WithdrawalFinalized event followed by the ERC20BridgeFinalized
+    ///         event. This is necessary for backwards compatibility with the legacy bridge.
+    function _emitERC20BridgeFinalized(
+        address _localToken,
+        address _remoteToken,
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes memory _extraData
+    )
+        internal
+        override
+    {
+        emit ERC20WithdrawalFinalized(_localToken, _remoteToken, _from, _to, _amount, _extraData);
+        super._emitERC20BridgeFinalized(_localToken, _remoteToken, _from, _to, _amount, _extraData);
+    }
+}
